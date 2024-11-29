@@ -1,0 +1,254 @@
+esphome:
+  project:
+    name: "rihan.multiSensor"
+    version: "1.0.0"
+  platformio_options:
+    board_build.f_cpu: 80000000L
+  on_boot: 
+    - priority: 900
+      then:
+        - sensor.template.publish:
+            id: cpu_speed_t
+            state: !lambda 'return ESP.getCpuFreqMHz();'
+    - priority: -100
+      then:
+        - select.set: 
+            id: ld2412_baud_rate
+            option: !lambda 'return id(uart_baud_rate);'
+        - delay: 2s
+        - lambda: |-
+            id(LD2410)->read_all_info();            
+        - delay: 2s
+        - lambda: |-
+            id(LD2410)->set_engineering_mode(true);            
+        - globals.set: 
+            id: init_complete
+            value: 'true'
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: arduino
+wifi:
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Multisensor"
+    password: "Multisensor"
+
+captive_portal:
+
+globals:
+  - id: uart_baud_rate
+    type: std::string
+    restore_value: yes
+    max_restore_data_length: 6
+    initial_value: '"256000"'
+  - id: init_complete
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  
+uart:
+  id: uart_bus
+  rx_pin: 
+    number: GPIO21
+    mode:
+      input: true
+      pullup: true
+  tx_pin: 
+    number: GPIO20
+    mode:
+      input: true
+      pullup: true
+  baud_rate: 256000
+  parity: NONE
+i2c:
+  sda: GPIO10
+  scl: GPIO09
+  scan: false
+  id: bus_a
+
+LD2412:
+  id: ld2412
+  throttle: 100ms
+
+binary_sensor:
+  - platform: LD2412
+    has_target:
+      id: has_target
+      name: Presence
+  - platform: template
+    name: Illuminance above the threshold
+    id: illuminance_above_threshold
+    lambda: |-
+      return id(light_percentage).state > id(illuminance_threshold_input).state;      
+    device_class: light
+
+sensor:
+  - platform: LD2412
+    light:
+      id: light_percentage
+      name: light
+      filters:
+        - sliding_window_moving_average:
+            window_size: 270
+            send_every: 180
+            send_first_at: 1
+  - platform: internal_temperature
+    name: "Internal Temperature"
+    update_interval: 30s
+    entity_category: "diagnostic"
+    disabled_by_default: true
+  - platform: template
+    id: cpu_speed_t
+    name: "cpu speed"
+    entity_category: "diagnostic"
+    accuracy_decimals: 0
+    update_interval: never
+    disabled_by_default: true
+  - platform: shtcx
+    address: 0x70
+    update_interval: 30s
+    temperature:
+      name: "Temperature"
+      id: bme280_temperature
+      internal: true
+      on_value:
+        then:
+        - component.update: temperature
+      filters:
+        - median:
+            window_size: 6
+            send_every: 4
+            send_first_at: 1
+    humidity:
+      name: "Relative Humidity"
+      id: bme280_humidity
+      filters:
+        - median:
+            window_size: 6
+            send_every: 4
+            send_first_at: 1
+        - lambda: |-
+            double tc = id(bme280_temperature).state;
+            double ta = id(temperature).state;
+            //kelvin conversion
+            tc = tc + 273.15; 
+            ta = ta + 273.15;
+            //calculate saturation pressure
+            double pc = 6.109 * exp(( 17.625 * tc )/(tc+243.04));
+            double pa = 6.109 * exp(( 17.625 * ta )/(ta+243.04));
+            //humidity adjustment
+            double rf = pc / pa;
+            rf = rf * (ta / tc);
+            rf = rf * x;
+            return round(rf);            
+  - platform: template
+    name: 'Temperature'
+    id: temperature
+    device_class: temperature
+    state_class: "measurement"
+    unit_of_measurement: '°C'
+    accuracy_decimals: 1
+    update_interval: never
+    lambda: |-
+      return id(bme280_temperature).state;      
+    filters:
+      - lambda: |-
+          return x + id(t_offset).state;          
+number:
+  - platform: LD2412
+    timeout:
+      name: "presence holding"
+    min_distance_gate:
+      name: "min distance gate"
+    max_distance_gate:
+      name: "max distance gate"
+  - platform: template
+    name: "Illuminance threshold"
+    id: illuminance_threshold_input
+    min_value: 0
+    max_value: 255
+    step: 1
+    entity_category: "config"
+    restore_value: true
+    optimistic: true
+    mode: slider
+  - platform: template
+    name: "Temperature offset"
+    id: t_offset
+    min_value: -5.0
+    max_value: 5.0
+    step: 0.1
+    entity_category: "config"
+    unit_of_measurement: °C
+    restore_value: true
+    optimistic: true
+    on_value:
+      then:
+        - component.update: temperature
+
+  
+select:
+  - platform: LD2412
+    out_pin_level:
+      name: 'Hardware output pin level'
+      disabled_by_default: true
+    distance_resolution:
+      name: 'Distance resolution'
+    baud_rate:
+      name: "baud rate"
+      id: ld2412_baud_rate
+      on_value:
+        - delay: 100ms
+        - lambda: |-
+            id(uart_bus).flush();
+            uint32_t new_baud_rate = stoi(x);
+            ESP_LOGD("change_baud_rate", "Changing baud rate from %i to %i",id(uart_bus).get_baud_rate(), new_baud_rate);
+            if (id(uart_bus).get_baud_rate() != new_baud_rate) {
+            id(uart_bus).set_baud_rate(new_baud_rate);
+            id(uart_bus).load_settings();
+            }
+            if(id(init_complete)){
+            id(uart_baud_rate) = x;
+            }              
+    mode:
+      name: "Mode"
+button:
+  - platform: LD2412
+    factory_reset:
+      name: "Reset LD2412"
+      disabled_by_default: true
+    restart:
+      name: "Restart LD2412"
+      disabled_by_default: true
+    query_params:
+      name: query params
+      disabled_by_default: true
+  - platform: restart
+    name: "Restart device"
+    disabled_by_default: true
+
+text_sensor:
+  - platform: LD2412
+    version:
+      name: "firmware version"
+      disabled_by_default: true
+    mac_address:
+      name: "mac address"
+      disabled_by_default: true
+
+switch:
+  - platform: LD2412
+    bluetooth:
+      name: "Bluetooth"
+
+light:
+  - platform: status_led
+    name: "Status Led"
+    internal: True
+    pin:
+      number: GPIO08
+      inverted: true
